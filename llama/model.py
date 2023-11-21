@@ -15,6 +15,9 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+import sys
+print(sys.path)
+
 import triton_softmax
 
 @dataclass
@@ -204,7 +207,6 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
@@ -250,7 +252,17 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         ).cuda()
-
+        self.triton_softmax = triton_softmax.softmax
+    def apply_custom_softmax(self, scores):
+        # Original shape: [6, 32, 18, 18]
+        original_shape = scores.shape
+        # Flatten the last two dimensions
+        scores_reshaped = scores.view(-1, original_shape[-1] * original_shape[-2])
+        # Apply softmax
+        softmax_scores = self.triton_softmax(scores_reshaped)
+        # Reshape back to original shape
+        softmax_scores_reshaped = softmax_scores.view(original_shape)
+        return softmax_scores_reshaped
     def forward(
         self,
         x: torch.Tensor,
@@ -299,9 +311,8 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        
-        # scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        scores = triton_softmax.softmax(scores.float()).type_as(xq)
+        #scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = self.apply_custom_softmax(scores.float()).type_as(xq)
 
 
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)

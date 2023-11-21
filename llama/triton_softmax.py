@@ -36,11 +36,12 @@ def softmax(x):
     # increasing the number of warps (`num_warps`) over which each row is distributed.
     # You will see in the next tutorial how to auto-tune this value in a more natural
     # way so you don't have to come up with manual heuristics yourself.
-    num_warps = 4
+    thread_multiplier = 1
+    num_warps = 4 * thread_multiplier
     if BLOCK_SIZE >= 2048:
-        num_warps = 8
+        num_warps = 8 * thread_multiplier
     if BLOCK_SIZE >= 4096:
-        num_warps = 16
+        num_warps = 16 * thread_multiplier
     # Allocate output
     y = torch.empty_like(x)
     # Enqueue kernel. The 1D launch grid is simple: we have one kernel instance per row o
