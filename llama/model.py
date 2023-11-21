@@ -19,6 +19,7 @@ import sys
 print(sys.path)
 
 import triton_softmax
+import triton_matmul
 
 @dataclass
 class ModelArgs:
@@ -252,6 +253,7 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         ).cuda()
+        self.triton_matmul = triton_matmul.matmul
         self.triton_softmax = triton_softmax.softmax
     def apply_custom_softmax(self, scores):
         # Original shape: [6, 32, 18, 18]
@@ -263,6 +265,27 @@ class Attention(nn.Module):
         # Reshape back to original shape
         softmax_scores_reshaped = softmax_scores.view(original_shape)
         return softmax_scores_reshaped
+    def apply_custom_matmul(self, tensor1, tensor2):
+        # Original shapes
+        original_shape1 = tensor1.shape  # torch.Size([6, 32, 18, 128])
+        original_shape2 = tensor2.shape  # torch.Size([6, 32, 128, 18])
+
+        # Reshape the first tensor to 2D (flatten the last two dimensions)
+        tensor1_2d = tensor1.reshape(-1, tensor1.shape[-2] * tensor1.shape[-1])  # torch.Size([6 * 32, 18 * 128])
+
+        # Reshape the second tensor to 2D (flatten the first two dimensions, swap last two)
+        tensor2_reshaped = tensor2.transpose(2, 3)  # Swap last two dimensions
+        tensor2_2d = tensor2_reshaped.reshape(-1, tensor2_reshaped.shape[-2] * tensor2_reshaped.shape[-1])  # torch.Size([6 * 32 * 128, 18])
+
+        # Call the Triton function with the reshaped tensors
+        output_2d = self.triton_matmul(tensor1_2d, tensor2_2d)
+
+        # Reshape output back to original shape
+        # Modify this based on what the expected output shape should be
+        output = output_2d.reshape(original_shape1)
+
+        return output
+
     def forward(
         self,
         x: torch.Tensor,
@@ -308,12 +331,15 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        print("shape")
+        print(xq.shape)
+        print(keys.transpose(2, 3).shape)
+        # scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = self.apply_custom_matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         #scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         scores = self.apply_custom_softmax(scores.float()).type_as(xq)
-
 
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
