@@ -20,6 +20,7 @@ print(sys.path)
 
 import triton_softmax
 import triton_matmul
+from fused_attention import attention as triton_attn
 
 @dataclass
 class ModelArgs:
@@ -269,23 +270,37 @@ class Attention(nn.Module):
         # Original shapes
         original_shape1 = tensor1.shape  # torch.Size([6, 32, 18, 128])
         original_shape2 = tensor2.shape  # torch.Size([6, 32, 128, 18])
-
-        # Reshape the first tensor to 2D (flatten the last two dimensions)
-        tensor1_2d = tensor1.reshape(-1, tensor1.shape[-2] * tensor1.shape[-1])  # torch.Size([6 * 32, 18 * 128])
-
-        # Reshape the second tensor to 2D (flatten the first two dimensions, swap last two)
-        tensor2_reshaped = tensor2.transpose(2, 3)  # Swap last two dimensions
-        tensor2_2d = tensor2_reshaped.reshape(-1, tensor2_reshaped.shape[-2] * tensor2_reshaped.shape[-1])  # torch.Size([6 * 32 * 128, 18])
+        # Reshape the tensors to 2D for matrix multiplication
+        tensor1_2d = tensor1.reshape(-1, tensor1.shape[-2] * tensor1.shape[-1])  # Flattening last two dimensions
+        tensor2_2d = tensor2.reshape(-1, tensor2.shape[-2] * tensor2.shape[-1])  # Flattening last two dimensions
 
         # Call the Triton function with the reshaped tensors
-        output_2d = self.triton_matmul(tensor1_2d, tensor2_2d)
+        output_2d = self.triton_matmul(tensor1_2d, tensor2_2d.transpose(0, 1))
+        print(output_2d.shape)
+        # Reshape output back to the expected 4D shape
+        output = output_2d.reshape(original_shape1[0], original_shape1[1], original_shape1[2], original_shape2[3])
+        return output 
+    def custom_matmul(self, tensor1, tensor2):
+        # Assuming tensor1 and tensor2 are 4D and of shape [6, 32, 18, 128] and [6, 32, 128, 18] respectively
+        bsz, _, dim1, dim2 = tensor1.shape
+        _, _, dim3, dim4 = tensor2.shape
+        assert dim2 == dim3  # Ensuring the inner dimensions match for matmul
 
-        # Reshape output back to original shape
-        # Modify this based on what the expected output shape should be
-        output = output_2d.reshape(original_shape1)
+        # Initialize an output tensor
+        output = torch.empty((bsz, 32, dim1, dim4), device=tensor1.device, dtype=tensor1.dtype)
 
+        # Iterate over the batch and the second dimension
+        for b in range(bsz):
+            for i in range(32):
+                # Extract slices (2D submatrices) from tensor1 and tensor2
+                slice1 = tensor1[b, i]  # Shape [18, 128]
+                slice2 = tensor2[b, i]  # Shape [18, 128] -> Transpose to [128, 18]
+
+                # Perform 2D matrix multiplication using Triton
+                output_slice = self.triton_matmul(slice1, slice2)  # Output shape should be [18, 18]
+                # Place the result back into the output tensor
+                output[b, i] = output_slice
         return output
-
     def forward(
         self,
         x: torch.Tensor,
@@ -327,22 +342,31 @@ class Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        print("shape")
-        print(xq.shape)
-        print(keys.transpose(2, 3).shape)
-        # scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        scores = self.apply_custom_matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+#        print(values.is_contiguous())
+#        print(keys.is_contiguous())
+        testing_fused_attn = False
+        if testing_fused_attn ==True:
+           #fn =  lambda: triton_attn(xq, keys, values, False,1.3)
+           #output_from_fused  =  fn()
+           pass
+#        print("shape")
+#        print(xq.shape)
+#        print(keys.transpose(2, 3).shape)
+#        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+#        print(scores.shape)
+        scores = self.custom_matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+#        scores = triton_matmul.batched_matmul(xq, keys) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        #scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        scores = self.apply_custom_softmax(scores.float()).type_as(xq)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        #scores = self.apply_custom_softmax(scores.float()).type_as(xq)
 
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+#        print(output.dtype)
         return self.wo(output)
 
 
