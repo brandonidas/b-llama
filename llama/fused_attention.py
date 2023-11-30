@@ -25,6 +25,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr):
+    tl.device_print("_attn_fwd_inner")
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -36,10 +37,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         lo, hi = 0, N_CTX
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
+    tl.device_print("loop over k, v and update accumulator")
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
+        tl.device_print("compute qk")
         k = tl.load(K_block_ptr)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
@@ -58,13 +62,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         l_i = l_i * alpha + l_ij
         # -- update output accumulator --
         acc = acc * alpha[:, None]
+
         # update acc
+        tl.device_print("update acc")
         v = tl.load(V_block_ptr)
         acc += tl.dot(p.to(tl.float16), v)
         # update m_i and l_i
         m_i = m_ij
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+    tl.device_print("leaving inner function")
     return acc, l_i, m_i
 
 
@@ -106,12 +113,14 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               BLOCK_N: tl.constexpr,  #
               STAGE: tl.constexpr  #
               ):
+    tl.device_print("_attn_fwd")
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
     qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-
+    
+    tl.device_print("block pointers")
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
@@ -155,6 +164,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
+    tl.device_print("load q: it will stay in SRAM throughout")
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
     # stage 1: off-band
@@ -166,6 +176,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
                                         BLOCK_M, BLOCK_DMODEL, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX  #
                                         )
+        tl.device_print("finish stage 1")
     # stage 2: on-band
     if STAGE & 2:
         # barrier makes it easier for compielr to schedule the
@@ -176,7 +187,10 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
                                         BLOCK_M, BLOCK_DMODEL, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX  #
                                         )
+        tl.device_print("finish stage 2")
+    
     # epilogue
+    tl.device_assert("epilogue")
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -443,6 +457,7 @@ class Fused_Attention(torch.autograd.Function):
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
         assert Lk in {16, 32, 64, 128}
+        print("assert constraints PASSED")
         o = torch.empty_like(q)
         BLOCK_M = 128
         BLOCK_N = 64 if Lk <= 64 else 32
@@ -476,6 +491,54 @@ class Fused_Attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk
         ctx.causal = causal
+        return o
+    
+    def forward_nograd(q, k, v, causal, sm_scale):
+        print(q.shape)
+        print(k.shape)
+        print(v.shape)
+        # shape constraints
+        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+        assert q.is_contiguous()
+        assert k.is_contiguous()
+        assert v.is_contiguous()
+        assert Lq == Lk and Lk == Lv
+        assert Lk in {16, 32, 64, 128}
+        print("assert constraints PASSED")
+        o = torch.empty_like(q)
+        
+        BLOCK_M = 32
+        
+        BLOCK_N = 64 if Lk <= 64 else 32
+        
+        num_stages = 4 if Lk <= 64 else 3
+
+        num_warps = 1
+        
+        stage = 3 if causal else 1
+        # Tuning for H100
+        if torch.cuda.get_device_capability()[0] == 9:
+            num_warps = 8
+            num_stages = 7 if Lk >= 64 else 3
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        print("pre triton call")
+        _attn_fwd[grid](
+            q, k, v, sm_scale, M, o,  #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+            q.shape[0], q.shape[1],  #
+            N_CTX=q.shape[2],  #
+            BLOCK_M=BLOCK_M,  #
+            BLOCK_N=BLOCK_N,  #
+            BLOCK_DMODEL=Lk,  #
+            STAGE=stage,  #
+            num_warps=num_warps,  #
+            num_stages=num_stages  #
+        )
+
         return o
 
     @staticmethod
@@ -521,6 +584,7 @@ class Fused_Attention(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
+fwd_attention = Fused_Attention.forward_nograd
 attention = Fused_Attention.apply
 
 

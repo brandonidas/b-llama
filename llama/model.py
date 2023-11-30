@@ -20,7 +20,9 @@ print(sys.path)
 
 import triton_softmax
 import triton_matmul
-from fused_attention import attention as triton_attn
+from fused_attention import fwd_attention as triton_attn
+from flash_attn.flash_attn_interface import \
+        flash_attn_qkvpacked_func as flash_attn_func
 
 @dataclass
 class ModelArgs:
@@ -365,29 +367,36 @@ class Attention(nn.Module):
         values = values.transpose(1, 2).contiguous() # (bs, n_local_heads, cache_len + seqlen, head_dim)
         
         test_fused_attention = False
+        test_flash_attetnion = True
         if test_fused_attention:
-            #output = triton_attn(q)
+            causal = mask is not None
+            output = triton_attn(xq, keys, values, causal,1.3)
+            return output
+        elif test_fused_attention:
+            qkv = torch.stack((xq, keys, values), dim=2).contiguous()
+            output = flash_attn_func(qkv, causal=causal)
             pass
+        else:
 
-#        print(values.is_contiguous())
-#        print(keys.is_contiguous())
-#        print("shape")
-        #print(xq.shape)
-#        print(keys.transpose(2, 3).shape)
-        scores = torch.matmul(xq.contiguous(), keys.transpose(2, 3).contiguous()) / math.sqrt(self.head_dim)
-#        print(scores.is_contiguous())
-#        scores = self.custom_matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-#        scores = triton_matmul.batched_matmul(xq, keys) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        #print(scores.shape)#4d 
-        #scores = self.apply_custom_softmax(scores.float()).type_as(xq)
+    #        print(values.is_contiguous())
+    #        print(keys.is_contiguous())
+    #        print("shape")
+            #print(xq.shape)
+    #        print(keys.transpose(2, 3).shape)
+            scores = torch.matmul(xq.contiguous(), keys.transpose(2, 3).contiguous()) / math.sqrt(self.head_dim)
+    #        print(scores.is_contiguous())
+    #        scores = self.custom_matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+    #        scores = triton_matmul.batched_matmul(xq, keys) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            #scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            #print(scores.shape)#4d 
+            scores = self.apply_custom_softmax(scores.float()).type_as(xq)
 
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-#        print(output.dtype)
-        return self.wo(output)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+    #        print(output.dtype)
+            return self.wo(output)
 
 
 class FeedForward(nn.Module):

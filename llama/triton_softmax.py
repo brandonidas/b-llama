@@ -56,3 +56,39 @@ def softmax(x):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return y
+'''
+def batched_4d_softmax(x):
+    B, C, n_rows, n_cols = x.shape
+    # The block size is the smallest power of two greater than the number of columns in `x`
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    # Another trick we can use is to ask the compiler to use more threads per row by
+    # increasing the number of warps (`num_warps`) over which each row is distributed.
+    # You will see in the next tutorial how to auto-tune this value in a more natural
+    # way so you don't have to come up with manual heuristics yourself.
+    thread_multiplier = 1
+    num_warps = 4 * thread_multiplier
+    if BLOCK_SIZE >= 2048:
+        num_warps = 8 * thread_multiplier
+    if BLOCK_SIZE >= 4096:
+        num_warps = 16 * thread_multiplier
+    # Allocate output
+    y = torch.empty_like(x)
+    # Enqueue kernel. The 1D launch grid is simple: we have one kernel instance per row o
+    # f the input matrix
+    batched_4d_softmax_kernel[(n_rows,C,B)](
+        y,
+        x,
+        x.stride(0),
+        y.stride(0),
+        
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+
+
+        n_cols,
+        num_warps=num_warps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return y
+'''
